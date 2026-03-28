@@ -2,16 +2,17 @@ import os
 import math
 import time
 import threading
-from datetime import datetime
-
 import requests
+
 from binance.client import Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # ================= CONFIG =================
@@ -40,12 +41,6 @@ estado = {
 }
 
 # ================= UTILS =================
-def send(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg},
-    )
-
 def preco():
     return float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
 
@@ -65,10 +60,8 @@ def atualizar_precos(p):
 def take_auto():
     if len(estado["precos"]) < 5:
         return estado["take"]
-
     maior = max(estado["precos"])
     menor = min(estado["precos"])
-
     vol = ((maior - menor) / menor) * 100
     return max(1.0, min(2.2, 1.0 + vol))
 
@@ -116,7 +109,7 @@ def compra_inteligente():
 
             estado["posicoes"].append(pos)
 
-            send(f"🟢 COMPRA\nPreço: {fmt(p)}\nTake: {take:.2f}%")
+            print("COMPRA:", p)
 
             estado["referencia"] = p
             estado["ultima_minima"] = None
@@ -130,11 +123,11 @@ def vendas():
     for pos in estado["posicoes"]:
         if p >= pos["alvo"]:
             lucro = pos["qtd"] * p - pos["investido"]
-            send(f"💰 TAKE\nLucro: {fmt(lucro)}")
+            print("TAKE:", lucro)
 
         elif p <= pos["stop"]:
             lucro = pos["qtd"] * p - pos["investido"]
-            send(f"🛑 STOP\nResultado: {fmt(lucro)}")
+            print("STOP:", lucro)
 
         else:
             novas.append(pos)
@@ -153,41 +146,118 @@ def monitor():
             print("ERRO:", e)
 
 # ================= MENU =================
-def menu():
+def menu_principal():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Painel", callback_data="painel")],
         [InlineKeyboardButton("🤖 Auto ON/OFF", callback_data="auto")],
-        [InlineKeyboardButton("💰 Zerar", callback_data="zerar")]
+        [InlineKeyboardButton("💰 Comprar", callback_data="comprar")],
+        [InlineKeyboardButton("⚙️ Config", callback_data="config")]
+    ])
+
+def menu_config():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📉 Queda", callback_data="set_queda")],
+        [InlineKeyboardButton("🎯 Take", callback_data="set_take")],
+        [InlineKeyboardButton("🛑 Stop", callback_data="set_stop")],
+        [InlineKeyboardButton("💵 Valor", callback_data="set_valor")],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data="voltar")]
     ])
 
 # ================= BOTÕES =================
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    print("CLICK:", data)
+
+    if data == "painel":
+        p = preco()
+        await query.message.reply_text(
+            f"📊 PAINEL\n"
+            f"Preço: {fmt(p)}\n"
+            f"Auto: {estado['auto']}\n"
+            f"Queda: {estado['queda']}%\n"
+            f"Take: {estado['take']}%\n"
+            f"Valor: {fmt(estado['valor'])}\n"
+            f"Posições: {len(estado['posicoes'])}"
+        )
+
+    elif data == "auto":
+        estado["auto"] = not estado["auto"]
+        await query.message.reply_text(f"🤖 Auto: {estado['auto']}")
+
+    elif data == "comprar":
+        context.user_data["modo"] = "comprar"
+        await query.message.reply_text("Digite o valor em R$:")
+
+    elif data == "config":
+        await query.message.reply_text("⚙️ Configurações:", reply_markup=menu_config())
+
+    elif data == "voltar":
+        await query.message.reply_text("Menu:", reply_markup=menu_principal())
+
+    elif data == "set_queda":
+        context.user_data["modo"] = "queda"
+        await query.message.reply_text("Digite nova queda (%):")
+
+    elif data == "set_take":
+        context.user_data["modo"] = "take"
+        await query.message.reply_text("Digite novo take (%):")
+
+    elif data == "set_stop":
+        context.user_data["modo"] = "stop"
+        await query.message.reply_text("Digite novo stop (%):")
+
+    elif data == "set_valor":
+        context.user_data["modo"] = "valor"
+        await query.message.reply_text("Digite valor em R$:")
+
+# ================= TEXTO =================
+async def receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "modo" not in context.user_data:
+        return
+
     try:
-        query = update.callback_query
-        await query.answer()
+        valor = float(update.message.text.replace(",", "."))
 
-        print("CLICK:", query.data)
+        modo = context.user_data["modo"]
 
-        if query.data == "painel":
+        if modo == "queda":
+            estado["queda"] = valor
+
+        elif modo == "take":
+            estado["take"] = valor
+
+        elif modo == "stop":
+            estado["stop"] = valor
+
+        elif modo == "valor":
+            estado["valor"] = valor
+
+        elif modo == "comprar":
             p = preco()
-            await query.message.reply_text(
-                f"📊 Preço: {fmt(p)}\nPosições: {len(estado['posicoes'])}"
+            qtd = calc_qtd(valor, p)
+
+            client.create_test_order(
+                symbol=SYMBOL,
+                side="BUY",
+                type="MARKET",
+                quantity=qtd
             )
 
-        elif query.data == "auto":
-            estado["auto"] = not estado["auto"]
-            await query.message.reply_text(f"Auto: {estado['auto']}")
+            await update.message.reply_text(f"✅ Compra simulada: {fmt(valor)}")
 
-        elif query.data == "zerar":
-            estado["posicoes"] = []
-            await query.message.reply_text("💰 Zerado")
+        context.user_data.pop("modo")
 
-    except Exception as e:
-        print("ERRO BOTÃO:", e)
+        await update.message.reply_text("Atualizado!", reply_markup=menu_principal())
 
-# ================= COMANDOS =================
+    except:
+        await update.message.reply_text("Valor inválido")
+
+# ================= COMMAND =================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("MENU", reply_markup=menu())
+    await update.message.reply_text("Menu:", reply_markup=menu_principal())
 
 # ================= MAIN =================
 def main():
@@ -197,6 +267,7 @@ def main():
 
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receber_texto))
 
     print("BOT ONLINE 🚀")
     app.run_polling()
