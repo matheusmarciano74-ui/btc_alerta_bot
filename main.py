@@ -151,11 +151,8 @@ def registrar_trade(
 # UTILS
 # =========================================================
 
-def autorizado(update: Update) -> bool:
-    try:
-        return str(update.effective_chat.id) == CHAT_ID
-    except Exception:
-        return False
+def autorizado(update):
+    return True
 
 
 def send_text(msg: str):
