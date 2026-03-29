@@ -1,5 +1,6 @@
-python-telegram-bot==22.0
-requests==2.32.3
-python-dotenv==1.0.1
-matplotlib
+python-telegram-bot==20.7
+requests
 python-binance
+pandas
+ta
+matplotlib
