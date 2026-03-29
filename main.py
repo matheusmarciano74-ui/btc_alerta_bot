@@ -1,9 +1,9 @@
 import os
 import time
 import threading
+import requests
 from datetime import datetime
 
-import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from binance.client import Client
@@ -20,18 +20,27 @@ client = Client(API_KEY, API_SECRET)
 # ================= ESTADO =================
 estado = {
     "auto": True,
-    "estrategia": "REVERSAO",
+    "estrategia": "AUTO",
+
     "valor": 200,
+    "take": 1.2,
+    "stop": -7,
+    "queda": 2,
+    "max_niveis": 5,
+
+    "historico": [],
+    "historico_pnl": [],
+
+    "lucro_total": 0,
+    "trades": 0,
+    "wins": 0,
 
     # DCA
     "dca_ativo": False,
-    "dca_preco_base": 0,
     "dca_qtd": 0,
     "dca_total": 0,
     "dca_niveis": 0,
-
-    # histórico
-    "historico": []
+    "dca_preco_base": 0,
 }
 
 # ================= UTILS =================
@@ -50,43 +59,75 @@ def send(msg):
 def menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Painel", callback_data="painel")],
+        [InlineKeyboardButton("⚙️ Config", callback_data="config")],
         [InlineKeyboardButton("🤖 Auto ON/OFF", callback_data="auto")],
         [InlineKeyboardButton("🧠 Estratégia", callback_data="estrategia")],
     ])
 
 
-def menu_estrategia():
+def menu_config():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Reversão", callback_data="rev")],
-        [InlineKeyboardButton("💰 DCA Inteligente", callback_data="dca")],
+        [InlineKeyboardButton("💰 Valor", callback_data="cfg_valor")],
+        [InlineKeyboardButton("🎯 Take", callback_data="cfg_take")],
+        [InlineKeyboardButton("📉 Stop", callback_data="cfg_stop")],
+        [InlineKeyboardButton("📊 Queda", callback_data="cfg_queda")],
     ])
 
 
+def menu_estrategia():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("AUTO", callback_data="auto_mode")],
+        [InlineKeyboardButton("REVERSÃO", callback_data="rev")],
+        [InlineKeyboardButton("DCA", callback_data="dca")],
+    ])
+
 # ================= BOTÕES =================
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
+    q = update.callback_query
+    await q.answer()
+    data = q.data
 
     if data == "painel":
-        await query.message.reply_text(painel())
+        await q.message.reply_text(painel())
+
+    elif data == "config":
+        await q.message.reply_text("Configurações:", reply_markup=menu_config())
 
     elif data == "auto":
         estado["auto"] = not estado["auto"]
-        await query.message.reply_text(f"Auto: {estado['auto']}")
+        await q.message.reply_text(f"Auto: {estado['auto']}")
 
     elif data == "estrategia":
-        await query.message.reply_text("Escolha:", reply_markup=menu_estrategia())
+        await q.message.reply_text("Escolha:", reply_markup=menu_estrategia())
+
+    elif data == "auto_mode":
+        estado["estrategia"] = "AUTO"
+        await q.message.reply_text("🤖 AUTO ativado")
 
     elif data == "rev":
         estado["estrategia"] = "REVERSAO"
-        await query.message.reply_text("🔄 Reversão ativa")
+        await q.message.reply_text("🔄 Reversão ativa")
 
     elif data == "dca":
         estado["estrategia"] = "DCA"
         estado["dca_ativo"] = False
-        await query.message.reply_text("💰 DCA Inteligente ativado")
+        await q.message.reply_text("💰 DCA ativado")
+
+    elif data == "cfg_valor":
+        estado["valor"] += 50
+        await q.message.reply_text(f"Valor: {estado['valor']}")
+
+    elif data == "cfg_take":
+        estado["take"] += 0.2
+        await q.message.reply_text(f"Take: {estado['take']}%")
+
+    elif data == "cfg_stop":
+        estado["stop"] -= 1
+        await q.message.reply_text(f"Stop: {estado['stop']}%")
+
+    elif data == "cfg_queda":
+        estado["queda"] += 0.5
+        await q.message.reply_text(f"Queda: {estado['queda']}%")
 
 
 # ================= PAINEL =================
@@ -97,6 +138,8 @@ def painel():
     if estado["dca_qtd"] > 0:
         media = estado["dca_total"] / estado["dca_qtd"]
 
+    winrate = (estado["wins"] / estado["trades"] * 100) if estado["trades"] else 0
+
     return f"""
 📊 PAINEL
 
@@ -104,82 +147,89 @@ Auto: {estado['auto']}
 Estratégia: {estado['estrategia']}
 Preço: {round(p,2)}
 
+💰 Lucro: R${round(estado['lucro_total'],2)}
+📈 Trades: {estado['trades']}
+🎯 Winrate: {round(winrate,2)}%
+
 🧠 DCA:
 Ativo: {estado['dca_ativo']}
 Níveis: {estado['dca_niveis']}
 Preço médio: {round(media,2) if media else "-"}
 """
 
+# ================= ESTRATÉGIA AUTO =================
+def escolher_estrategia():
+    if len(estado["historico"]) < 10:
+        return "DCA"
 
-# ================= DCA INTELIGENTE =================
+    vol = (max(estado["historico"]) - min(estado["historico"])) / min(estado["historico"]) * 100
+
+    if vol > 1.5:
+        return "DCA"
+    return "REVERSAO"
+
+# ================= DCA PROFISSIONAL =================
 def dca():
     p = preco()
 
-    estado["historico"].append(p)
-    if len(estado["historico"]) > 20:
-        estado["historico"].pop(0)def dca():
-    p = preco()
+    TAXA = 0.001
 
     estado["historico"].append(p)
-    if len(estado["historico"]) > 30:
+    if len(estado["historico"]) > 50:
         estado["historico"].pop(0)
 
-    # INICIO
     if not estado["dca_ativo"]:
-        qtd_btc = estado["valor"] / p
+        qtd = (estado["valor"] * (1 - TAXA)) / p
 
         estado["dca_ativo"] = True
-        estado["dca_preco_base"] = p
-        estado["dca_qtd"] = qtd_btc
+        estado["dca_qtd"] = qtd
         estado["dca_total"] = estado["valor"]
         estado["dca_niveis"] = 1
+        estado["dca_preco_base"] = p
 
         send(f"🟢 DCA INÍCIO {p}")
         return
 
-    # ========================
-    # MÉDIA REAL
-    # ========================
     media = estado["dca_total"] / estado["dca_qtd"]
 
-    queda = ((estado["dca_preco_base"] - p) / estado["dca_preco_base"]) * 100
+    queda = (estado["dca_preco_base"] - p) / estado["dca_preco_base"] * 100
 
-    # ========================
-    # NOVA COMPRA
-    # ========================
-    if queda >= 2 and estado["dca_niveis"] < 3:
-        qtd_btc = estado["valor"] / p
+    if queda >= estado["queda"] and estado["dca_niveis"] < estado["max_niveis"]:
+        qtd = (estado["valor"] * (1 - TAXA)) / p
 
-        estado["dca_qtd"] += qtd_btc
+        estado["dca_qtd"] += qtd
         estado["dca_total"] += estado["valor"]
         estado["dca_niveis"] += 1
         estado["dca_preco_base"] = p
 
-        send(f"📉 DCA MÉDIA {estado['dca_niveis']}")
+        send("📉 DCA MÉDIA")
 
-    # ========================
-    # LUCRO REAL
-    # ========================
-    valor_atual = estado["dca_qtd"] * p
-    lucro_reais = valor_atual - estado["dca_total"]
-    lucro_percent = (lucro_reais / estado["dca_total"]) * 100
+    valor_final = estado["dca_qtd"] * p * (1 - TAXA)
+    lucro = valor_final - estado["dca_total"]
+    lucro_pct = (lucro / estado["dca_total"]) * 100
 
-    if lucro_percent >= 1.5:
-        estado["lucro_total"] += lucro_reais
-        estado["historico_pnl"].append(estado["lucro_total"])
+    if lucro_pct >= estado["take"]:
+        estado["lucro_total"] += lucro
         estado["trades"] += 1
-        estado["wins"] += 1
+        if lucro > 0:
+            estado["wins"] += 1
 
-        send(f"""💰 VENDA DCA
-
-Preço: {p}
-Lucro: R${round(lucro_reais,2)}
-Resultado: {round(lucro_percent,2)}%
-""")
+        send(f"💰 VENDA | lucro R${round(lucro,2)} ({round(lucro_pct,2)}%)")
 
         estado["dca_ativo"] = False
-        estado["dca_total"] = 0
         estado["dca_qtd"] = 0
+        estado["dca_total"] = 0
+        estado["dca_niveis"] = 0
+
+    if lucro_pct <= estado["stop"]:
+        send("🚨 STOP")
+
+        estado["trades"] += 1
+
+        estado["dca_ativo"] = False
+        estado["dca_qtd"] = 0
+        estado["dca_total"] = 0
+        estado["dca_niveis"] = 0
 
 
 # ================= LOOP =================
@@ -187,8 +237,12 @@ def loop():
     while True:
         try:
             if estado["auto"]:
+                modo = estado["estrategia"]
 
-                if estado["estrategia"] == "DCA":
+                if modo == "AUTO":
+                    modo = escolher_estrategia()
+
+                if modo == "DCA":
                     dca()
 
             time.sleep(5)
