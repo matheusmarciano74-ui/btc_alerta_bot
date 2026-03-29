@@ -152,8 +152,8 @@ def registrar_trade(
 # =========================================================
 
 def autorizado(update):
+    print("SEU CHAT ID:", update.effective_chat.id)
     return True
-
 
 def send_text(msg: str):
     try:
