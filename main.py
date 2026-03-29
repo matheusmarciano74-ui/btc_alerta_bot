@@ -2,12 +2,19 @@ import os
 import time
 import json
 import requests
-from datetime import datetime
+import pandas as pd
+from ta.momentum import RSIIndicator
+from binance.client import Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
+client = Client(API_KEY, API_SECRET)
 
 STATE_FILE = "state.json"
 
@@ -15,6 +22,7 @@ STATE_FILE = "state.json"
 def load():
     if not os.path.exists(STATE_FILE):
         return {
+            "modo": "SIMULADO",
             "rodando": True,
             "config": {
                 "queda": 2,
@@ -25,8 +33,7 @@ def load():
             },
             "posicoes": [],
             "lucro_total": 0,
-            "ultima_compra": 0,
-            "esperando": None
+            "ultima_compra": 0
         }
     return json.load(open(STATE_FILE))
 
@@ -35,85 +42,102 @@ def save():
 
 state = load()
 
-# ================= PREÇO =================
-def get_preco():
-    r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCBRL"})
-    return float(r.json()["price"])
-
 # ================= TELEGRAM =================
 def menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Status", callback_data="status")],
         [InlineKeyboardButton("⚙️ Config", callback_data="config")],
+        [InlineKeyboardButton("🧠 Modo: " + state["modo"], callback_data="modo")],
         [InlineKeyboardButton("▶️ Start", callback_data="start"),
          InlineKeyboardButton("⛔ Stop", callback_data="stop")]
-    ])
-
-def config_menu():
-    c = state["config"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Queda: {c['queda']}%", callback_data="set_queda")],
-        [InlineKeyboardButton(f"Lucro: {c['lucro']}%", callback_data="set_lucro")],
-        [InlineKeyboardButton(f"Valor: R${c['valor']}", callback_data="set_valor")],
-        [InlineKeyboardButton(f"Max DCA: {c['max_dca']}", callback_data="set_dca")],
-        [InlineKeyboardButton(f"Cooldown: {c['cooldown']}s", callback_data="set_cool")],
-        [InlineKeyboardButton("⬅️ Voltar", callback_data="menu")]
     ])
 
 async def send(msg, ctx):
     await ctx.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-# ================= DCA =================
+# ================= PREÇO =================
+def get_price():
+    return float(client.get_symbol_ticker(symbol="BTCBRL")["price"])
+
+def get_rsi():
+    klines = client.get_klines(symbol="BTCBRL", interval="1m", limit=50)
+    df = pd.DataFrame(klines)
+    df[4] = df[4].astype(float)
+    rsi = RSIIndicator(df[4]).rsi().iloc[-1]
+    return rsi
+
+# ================= COMPRA =================
 def comprar(preco):
-    q = state["config"]["valor"] / preco
+    valor = state["config"]["valor"]
+    q = valor / preco
+
+    if state["modo"] == "REAL":
+        client.order_market_buy(symbol="BTCBRL", quoteOrderQty=valor)
+
     state["posicoes"].append({"preco": preco, "q": q})
     state["ultima_compra"] = time.time()
 
+# ================= VENDA =================
 def vender(p, preco):
+    if state["modo"] == "REAL":
+        client.order_market_sell(symbol="BTCBRL", quantity=p["q"])
+
     lucro = (preco - p["preco"]) * p["q"]
     state["lucro_total"] += lucro
 
-# ================= LOGICA =================
-def verificar(preco):
-    if not state["posicoes"]:
-        comprar(preco)
-        return
+# ================= IA =================
+def entrada_inteligente(preco):
+    rsi = get_rsi()
 
-    ultima = state["posicoes"][-1]["preco"]
-    queda = ((ultima - preco)/ultima)*100
+    if rsi < 30:
+        return True
+    return False
 
-    if (
-        queda >= state["config"]["queda"]
-        and len(state["posicoes"]) < state["config"]["max_dca"]
-        and time.time() - state["ultima_compra"] > state["config"]["cooldown"]
-    ):
-        comprar(preco)
+# ================= LOOP =================
+async def loop(ctx: ContextTypes.DEFAULT_TYPE):
+    while True:
+        try:
+            if state["rodando"]:
+                preco = get_price()
 
-def vendas(preco):
-    novas = []
-    for p in state["posicoes"]:
-        ganho = ((preco - p["preco"]) / p["preco"]) * 100
-        if ganho >= state["config"]["lucro"]:
-            vender(p, preco)
-        else:
-            novas.append(p)
-    state["posicoes"] = novas
+                if entrada_inteligente(preco):
+                    comprar(preco)
+
+                novas = []
+                for p in state["posicoes"]:
+                    ganho = ((preco - p["preco"]) / p["preco"]) * 100
+                    if ganho >= state["config"]["lucro"]:
+                        vender(p, preco)
+                    else:
+                        novas.append(p)
+
+                state["posicoes"] = novas
+                print(preco)
+
+            save()
+            time.sleep(10)
+
+        except Exception as e:
+            print(e)
+            time.sleep(5)
 
 # ================= CALLBACK =================
 async def click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data == "menu":
-        await q.message.reply_text("Menu", reply_markup=menu())
+    if q.data == "modo":
+        state["modo"] = "REAL" if state["modo"] == "SIMULADO" else "SIMULADO"
+        await send(f"Modo alterado para {state['modo']}", ctx)
 
-    elif q.data == "config":
-        await q.message.reply_text("Configuração:", reply_markup=config_menu())
-
-    elif q.data.startswith("set_"):
-        campo = q.data.replace("set_", "")
-        state["esperando"] = campo
-        await send(f"Digite novo valor para {campo}", ctx)
+    elif q.data == "status":
+        txt = f"""
+Modo: {state['modo']}
+Preço: {get_price()}
+Posições: {len(state['posicoes'])}
+Lucro: {state['lucro_total']}
+"""
+        await send(txt, ctx)
 
     elif q.data == "start":
         state["rodando"] = True
@@ -125,60 +149,15 @@ async def click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     save()
 
-# ================= INPUT =================
-async def receber(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not state["esperando"]:
-        return
-
-    campo = state["esperando"]
-    valor = float(update.message.text)
-
-    if campo == "queda":
-        state["config"]["queda"] = valor
-    elif campo == "lucro":
-        state["config"]["lucro"] = valor
-    elif campo == "valor":
-        state["config"]["valor"] = valor
-    elif campo == "dca":
-        state["config"]["max_dca"] = int(valor)
-    elif campo == "cool":
-        state["config"]["cooldown"] = int(valor)
-
-    state["esperando"] = None
-
-    await update.message.reply_text("Atualizado!", reply_markup=config_menu())
-    save()
-
-# ================= STATUS =================
-async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txt = f"""
-Preço: {get_preco():.2f}
-Posições: {len(state['posicoes'])}
-Lucro: {state['lucro_total']:.2f}
-"""
-    await update.message.reply_text(txt, reply_markup=menu())
-
-# ================= LOOP =================
-async def loop(ctx: ContextTypes.DEFAULT_TYPE):
-    while True:
-        try:
-            if state["rodando"]:
-                preco = get_preco()
-                verificar(preco)
-                vendas(preco)
-                print(preco)
-
-            save()
-            time.sleep(10)
-        except:
-            time.sleep(5)
+# ================= START =================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("BOT PRO", reply_markup=menu())
 
 # ================= MAIN =================
 app = Application.builder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", status))
+app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(click))
-app.add_handler(MessageHandler(filters.TEXT, receber))
 
 app.job_queue.run_repeating(loop, interval=10, first=5)
 
