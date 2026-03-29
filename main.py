@@ -1,67 +1,101 @@
-import json
-import os
-import requests
-import pandas as pd
+# ===== NOVOS IMPORTS =====
 import matplotlib.pyplot as plt
-from datetime import datetime
-from telegram import *
-from telegram.ext import *
+import pandas as pd
 from binance.client import Client
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
 
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-
 client = Client(API_KEY, API_SECRET)
 
-STATE_FILE = "state.json"
+# =========================
+# 🔥 ADICIONA NO MENU PRINCIPAL
+# =========================
 
-def load():
-    if not os.path.exists(STATE_FILE):
-        return {
-            "modo": "SIMULADO",
-            "rodando": False,
-            "config": {"queda": 2, "lucro": 3, "valor": 100, "max_dca": 5},
-            "posicoes": [],
-            "lucro_total": 0,
-            "historico": []
-        }
-    return json.load(open(STATE_FILE))
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Status", callback_data="status"),
+            InlineKeyboardButton("📦 Posições", callback_data="positions"),
+        ],
+        [
+            InlineKeyboardButton("📈 BTC", callback_data="grafico_btc"),
+            InlineKeyboardButton("💰 Lucro", callback_data="grafico_lucro"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Config", callback_data="config"),
+            InlineKeyboardButton("🧾 Logs", callback_data="logs"),
+        ],
+        [
+            InlineKeyboardButton(f"🧠 Modo: {state['modo']}", callback_data="modo"),
+        ],
+        [
+            InlineKeyboardButton("▶️ Start", callback_data="start"),
+            InlineKeyboardButton("⛔ Stop", callback_data="stop"),
+        ],
+        [
+            InlineKeyboardButton("🟢 Comprar", callback_data="buy"),
+            InlineKeyboardButton("🔴 Vender tudo", callback_data="sell_all"),
+        ],
+    ])
 
-def save():
-    json.dump(state, open(STATE_FILE, "w"))
+# =========================
+# 🔥 COMPRA (ATUALIZADA)
+# =========================
 
-state = load()
-
-# ================= PREÇO =================
-def get_price():
-    return float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCBRL").json()["price"])
-
-# ================= COMPRA =================
-def comprar(preco):
-    valor = state["config"]["valor"]
+def buy_simulated(preco, motivo):
+    valor = float(state["config"]["valor"])
     qtd = valor / preco
 
     if state["modo"] == "REAL":
-        client.order_market_buy(symbol="BTCBRL", quoteOrderQty=valor)
+        try:
+            client.order_market_buy(symbol="BTCBRL", quoteOrderQty=valor)
+        except Exception as e:
+            add_log(f"ERRO compra real: {e}")
 
-    state["posicoes"].append({"preco": preco, "q": qtd})
-    save()
+    lucro_pct = float(state["config"]["lucro"])
+    tp = preco * (1 + lucro_pct / 100)
 
-# ================= VENDA =================
-def vender(p, preco):
+    state["posicoes"].append({
+        "status": "OPEN",
+        "preco": preco,
+        "q": qtd,
+        "valor": valor,
+        "tp": tp,
+    })
+
+    save_state(state)
+    add_log(f"Compra em {preco}")
+
+# =========================
+# 🔥 VENDA (ATUALIZADA)
+# =========================
+
+def sell_position_simulated(p, preco_saida, motivo):
     if state["modo"] == "REAL":
-        client.order_market_sell(symbol="BTCBRL", quantity=p["q"])
+        try:
+            client.order_market_sell(symbol="BTCBRL", quantity=p["q"])
+        except Exception as e:
+            add_log(f"ERRO venda real: {e}")
 
-    lucro = (preco - p["preco"]) * p["q"]
+    lucro = (preco_saida - p["preco"]) * p["q"]
     state["lucro_total"] += lucro
-    state["historico"].append(state["lucro_total"])
-    save()
 
-# ================= GRAFICO BTC =================
-def grafico_btc():
+    # 🔥 guarda histórico pro gráfico
+    if "historico" not in state:
+        state["historico"] = []
+
+    state["historico"].append(state["lucro_total"])
+
+    p["status"] = "CLOSED"
+
+    save_state(state)
+    return lucro
+
+# =========================
+# 🔥 GRAFICO BTC
+# =========================
+
+def gerar_grafico_btc():
     klines = client.get_klines(symbol="BTCBRL", interval="5m", limit=100)
     df = pd.DataFrame(klines)
     df[4] = df[4].astype(float)
@@ -72,96 +106,47 @@ def grafico_btc():
     plt.savefig("btc.png")
     plt.close()
 
-# ================= GRAFICO LUCRO =================
-def grafico_lucro():
+# =========================
+# 🔥 GRAFICO LUCRO
+# =========================
+
+def gerar_grafico_lucro():
+    if "historico" not in state or len(state["historico"]) == 0:
+        return False
+
     plt.figure()
     plt.plot(state["historico"])
-    plt.title("Lucro")
+    plt.title("Lucro acumulado")
     plt.savefig("lucro.png")
     plt.close()
+    return True
 
-# ================= MENU =================
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Status", callback_data="status")],
-        [InlineKeyboardButton("📈 BTC", callback_data="btc")],
-        [InlineKeyboardButton("💰 Lucro", callback_data="lucro")],
-        [InlineKeyboardButton("⚙️ Config", callback_data="config")],
-        [InlineKeyboardButton(f"🧠 {state['modo']}", callback_data="modo")],
-        [InlineKeyboardButton("▶️ Start", callback_data="start"),
-         InlineKeyboardButton("⛔ Stop", callback_data="stop")]
-    ])
+# =========================
+# 🔥 CALLBACK (ADICIONAR ESSES CASOS)
+# =========================
 
-# ================= CALLBACK =================
-async def click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+# dentro do handle_callback:
 
-    data = q.data
+elif data == "grafico_btc":
+    gerar_grafico_btc()
+    await context.bot.send_photo(chat_id=CHAT_ID, photo=open("btc.png", "rb"))
 
-    if data == "status":
-        await q.message.reply_text(f"""
-Modo: {state['modo']}
-Preço: {get_price()}
-Lucro: {state['lucro_total']}
-Posições: {len(state['posicoes'])}
-""")
+elif data == "grafico_lucro":
+    ok = gerar_grafico_lucro()
+    if ok:
+        await context.bot.send_photo(chat_id=CHAT_ID, photo=open("lucro.png", "rb"))
+    else:
+        await context.bot.send_message(chat_id=CHAT_ID, text="Sem histórico ainda")
 
-    elif data == "btc":
-        grafico_btc()
-        await ctx.bot.send_photo(chat_id=CHAT_ID, photo=open("btc.png","rb"))
+# =========================
+# 🔥 MODO (AJUSTE)
+# =========================
 
-    elif data == "lucro":
-        grafico_lucro()
-        await ctx.bot.send_photo(chat_id=CHAT_ID, photo=open("lucro.png","rb"))
-
-    elif data == "modo":
-        state["modo"] = "REAL" if state["modo"] == "SIMULADO" else "SIMULADO"
-        save()
-        await q.message.reply_text(f"Modo: {state['modo']}")
-
-    elif data == "start":
-        state["rodando"] = True
-        save()
-        await q.message.reply_text("Bot ON")
-
-    elif data == "stop":
-        state["rodando"] = False
-        save()
-        await q.message.reply_text("Bot OFF")
-
-# ================= LOOP =================
-async def loop(ctx):
-    if not state["rodando"]:
-        return
-
-    preco = get_price()
-
-    if len(state["posicoes"]) == 0:
-        comprar(preco)
-
-    novas = []
-    for p in state["posicoes"]:
-        ganho = ((preco - p["preco"]) / p["preco"]) * 100
-        if ganho >= state["config"]["lucro"]:
-            vender(p, preco)
-        else:
-            novas.append(p)
-
-    state["posicoes"] = novas
-    save()
-
-# ================= START =================
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("BOT ONLINE", reply_markup=menu())
-
-app = Application.builder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(click))
-
-app.job_queue.run_repeating(loop, interval=10, first=5)
-
-print("BOT PRO INICIADO")
-
-app.run_polling()
+elif data == "modo":
+    state["modo"] = "REAL" if state["modo"] == "SIMULADO" else "SIMULADO"
+    save_state(state)
+    add_log(f"Modo: {state['modo']}")
+    await query.edit_message_text(
+        f"Modo alterado para: {state['modo']}",
+        reply_markup=main_menu(),
+    )
