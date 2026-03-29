@@ -117,76 +117,65 @@ def dca():
 
     estado["historico"].append(p)
     if len(estado["historico"]) > 20:
+        estado["historico"].pop(0)def dca():
+    p = preco()
+
+    estado["historico"].append(p)
+    if len(estado["historico"]) > 30:
         estado["historico"].pop(0)
 
-    # ================= TENDÊNCIA =================
-    tendencia_ok = True
-
-    if len(estado["historico"]) >= 10:
-        media_curta = sum(estado["historico"][-5:]) / 5
-        media_longa = sum(estado["historico"][-10:]) / 10
-
-        if media_curta < media_longa:
-            tendencia_ok = False
-
-    # ================= INICIO =================
+    # INICIO
     if not estado["dca_ativo"]:
-
-        if not tendencia_ok:
-            print("⛔ Evitando compra em queda forte")
-            return
+        qtd_btc = estado["valor"] / p
 
         estado["dca_ativo"] = True
         estado["dca_preco_base"] = p
-        estado["dca_qtd"] = 1
+        estado["dca_qtd"] = qtd_btc
         estado["dca_total"] = estado["valor"]
         estado["dca_niveis"] = 1
 
         send(f"🟢 DCA INÍCIO {p}")
         return
 
+    # ========================
+    # MÉDIA REAL
+    # ========================
     media = estado["dca_total"] / estado["dca_qtd"]
-
-    # ================= VOLATILIDADE =================
-    maior = max(estado["historico"])
-    menor = min(estado["historico"])
-
-    volatilidade = ((maior - menor) / menor) * 100
-
-    distancia = max(1.5, min(3.0, volatilidade))
 
     queda = ((estado["dca_preco_base"] - p) / estado["dca_preco_base"]) * 100
 
-    # ================= MÉDIA =================
-    if (
-        queda >= distancia
-        and estado["dca_niveis"] < 3
-        and tendencia_ok
-    ):
-        estado["dca_qtd"] += 1
+    # ========================
+    # NOVA COMPRA
+    # ========================
+    if queda >= 2 and estado["dca_niveis"] < 3:
+        qtd_btc = estado["valor"] / p
+
+        estado["dca_qtd"] += qtd_btc
         estado["dca_total"] += estado["valor"]
         estado["dca_niveis"] += 1
         estado["dca_preco_base"] = p
 
-        send(f"📉 DCA MÉDIA {estado['dca_niveis']} | {round(p,2)}")
+        send(f"📉 DCA MÉDIA {estado['dca_niveis']}")
 
-    # ================= TAKE =================
-    take = max(1.0, min(2.2, volatilidade))
+    # ========================
+    # LUCRO REAL
+    # ========================
+    valor_atual = estado["dca_qtd"] * p
+    lucro_reais = valor_atual - estado["dca_total"]
+    lucro_percent = (lucro_reais / estado["dca_total"]) * 100
 
-    lucro = ((p - media) / media) * 100
+    if lucro_percent >= 1.5:
+        estado["lucro_total"] += lucro_reais
+        estado["historico_pnl"].append(estado["lucro_total"])
+        estado["trades"] += 1
+        estado["wins"] += 1
 
-    if lucro >= take:
-        send(f"💰 VENDA DCA | lucro {round(lucro,2)}%")
+        send(f"""💰 VENDA DCA
 
-        estado["dca_ativo"] = False
-        estado["dca_total"] = 0
-        estado["dca_qtd"] = 0
-
-    # ================= STOP =================
-    perda = ((p - media) / media) * 100
-
-    if perda <= -6:
-        send("🚨 STOP GLOBAL")
+Preço: {p}
+Lucro: R${round(lucro_reais,2)}
+Resultado: {round(lucro_percent,2)}%
+""")
 
         estado["dca_ativo"] = False
         estado["dca_total"] = 0
