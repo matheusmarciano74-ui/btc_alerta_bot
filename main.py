@@ -3,7 +3,7 @@ import logging
 import math
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import requests
@@ -53,6 +53,17 @@ def default_state() -> Dict[str, Any]:
             "max_dca": 5,
             "cooldown": 600
         },
+        "auto_estrategia": True,
+        "regime_mercado": "INDEFINIDO",
+        "config_ativa": {
+            "queda": 2.0,
+            "lucro": 3.0,
+            "valor": 100.0,
+            "max_dca": 5,
+            "cooldown": 600
+        },
+        "ultimo_snapshot_estrategia": "",
+        "historico_regime": [],
         "posicoes": [],
         "lucro_total": 0.0,
         "ultima_compra_ts": 0,
@@ -80,6 +91,9 @@ def load_state() -> Dict[str, Any]:
         if not isinstance(state.get("config"), dict):
             state["config"] = default_state()["config"]
 
+        if not isinstance(state.get("config_ativa"), dict):
+            state["config_ativa"] = dict(state["config"])
+
         if not isinstance(state.get("posicoes"), list):
             state["posicoes"] = []
 
@@ -88,6 +102,9 @@ def load_state() -> Dict[str, Any]:
 
         if not isinstance(state.get("historico_lucro"), list):
             state["historico_lucro"] = []
+
+        if not isinstance(state.get("historico_regime"), list):
+            state["historico_regime"] = []
 
         return state
 
@@ -110,7 +127,7 @@ def add_log(msg: str) -> None:
     line = f"[{datetime.now().strftime('%d/%m %H:%M:%S')}] {msg}"
     logger.info(msg)
     state["logs"].append(line)
-    state["logs"] = state["logs"][-40:]
+    state["logs"] = state["logs"][-50:]
     save_state(state)
 
 
@@ -124,10 +141,6 @@ def format_brl(v: float) -> str:
     return f"R$ {s}"
 
 
-def format_pct(v: float) -> str:
-    return f"{v:.2f}%"
-
-
 def now_ts() -> int:
     return int(datetime.now().timestamp())
 
@@ -139,11 +152,10 @@ def get_public_price() -> float:
         timeout=15,
     )
     r.raise_for_status()
-    data = r.json()
-    return float(data["price"])
+    return float(r.json()["price"])
 
 
-def get_public_klines(limit: int = 100, interval: str = "5m") -> List[List[Any]]:
+def get_public_klines(limit: int = 120, interval: str = "5m") -> List[List[Any]]:
     r = requests.get(
         "https://api.binance.com/api/v3/klines",
         params={"symbol": SYMBOL, "interval": interval, "limit": limit},
@@ -184,9 +196,10 @@ def adjust_quantity_to_step(quantity: float) -> float:
 
     adjusted = math.floor(quantity / step_size) * step_size
 
+    step_str = f"{step_size:.18f}".rstrip("0")
     decimals = 0
-    if "." in str(step_size):
-        decimals = len(str(step_size).rstrip("0").split(".")[1])
+    if "." in step_str:
+        decimals = len(step_str.split(".")[1])
 
     adjusted = round(adjusted, decimals)
 
@@ -220,11 +233,197 @@ def total_pnl_aberto(preco_atual: Optional[float]) -> float:
 
 
 def can_buy() -> bool:
-    if len(open_positions()) >= int(state["config"]["max_dca"]):
+    if len(open_positions()) >= int(get_active_config()["max_dca"]):
         return False
 
-    cooldown = int(state["config"]["cooldown"])
+    cooldown = int(get_active_config()["cooldown"])
     return (now_ts() - int(state.get("ultima_compra_ts", 0))) >= cooldown
+
+
+# =========================================================
+# INDICADORES / ESTRATÉGIA
+# =========================================================
+
+def ema(values: List[float], period: int) -> float:
+    if len(values) < period:
+        return sum(values) / len(values)
+
+    k = 2 / (period + 1)
+    ema_value = sum(values[:period]) / period
+    for price in values[period:]:
+        ema_value = price * k + ema_value * (1 - k)
+    return ema_value
+
+
+def calc_rsi(values: List[float], period: int = 14) -> float:
+    if len(values) < period + 1:
+        return 50.0
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def analyze_market() -> Dict[str, Any]:
+    klines = get_public_klines(limit=120, interval="5m")
+    closes = [float(k[4]) for k in klines]
+
+    if len(closes) < 60:
+        return {
+            "regime": "INDEFINIDO",
+            "ema9": 0.0,
+            "ema21": 0.0,
+            "ema50": 0.0,
+            "rsi": 50.0,
+            "slope_pct": 0.0,
+            "pullback_pct": 0.0,
+            "last_price": closes[-1] if closes else 0.0,
+        }
+
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    ema50 = ema(closes, 50)
+    rsi = calc_rsi(closes, 14)
+
+    last_price = closes[-1]
+    old_price = closes[-13] if len(closes) >= 13 else closes[0]
+    slope_pct = ((last_price - old_price) / old_price) * 100 if old_price else 0.0
+
+    recent_high = max(closes[-18:])
+    pullback_pct = ((recent_high - last_price) / recent_high) * 100 if recent_high else 0.0
+
+    regime = "LATERAL"
+
+    if ema9 > ema21 > ema50 and slope_pct > 0.35:
+        regime = "ALTA"
+    elif ema9 < ema21 < ema50 and slope_pct < -0.35:
+        regime = "QUEDA"
+    else:
+        regime = "LATERAL"
+
+    return {
+        "regime": regime,
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema50": ema50,
+        "rsi": rsi,
+        "slope_pct": slope_pct,
+        "pullback_pct": pullback_pct,
+        "last_price": last_price,
+    }
+
+
+def strategy_for_regime(regime: str) -> Dict[str, Any]:
+    base_valor = float(state["config"]["valor"])
+
+    if regime == "ALTA":
+        return {
+            "queda": 0.8,
+            "lucro": 2.0,
+            "valor": base_valor,
+            "max_dca": 3,
+            "cooldown": 180,
+        }
+
+    if regime == "QUEDA":
+        return {
+            "queda": 2.0,
+            "lucro": 3.2,
+            "valor": base_valor,
+            "max_dca": max(5, int(state["config"]["max_dca"])),
+            "cooldown": 600,
+        }
+
+    return {
+        "queda": 1.1,
+        "lucro": 1.7,
+        "valor": base_valor,
+        "max_dca": 3,
+        "cooldown": 300,
+    }
+
+
+def get_active_config() -> Dict[str, Any]:
+    if state.get("auto_estrategia", True):
+        return state.get("config_ativa", dict(state["config"]))
+    return state["config"]
+
+
+def snapshot_strategy_text(analysis: Dict[str, Any], active_cfg: Dict[str, Any]) -> str:
+    return (
+        f"regime={analysis['regime']} | "
+        f"rsi={analysis['rsi']:.2f} | "
+        f"ema9={analysis['ema9']:.2f} | "
+        f"ema21={analysis['ema21']:.2f} | "
+        f"ema50={analysis['ema50']:.2f} | "
+        f"slope={analysis['slope_pct']:.2f}% | "
+        f"pullback={analysis['pullback_pct']:.2f}% | "
+        f"queda={active_cfg['queda']} | "
+        f"lucro={active_cfg['lucro']} | "
+        f"dca={active_cfg['max_dca']} | "
+        f"cooldown={active_cfg['cooldown']}"
+    )
+
+
+def should_buy_professional(analysis: Dict[str, Any], preco: float) -> Tuple[bool, str]:
+    regime = analysis["regime"]
+    rsi = analysis["rsi"]
+    pullback = analysis["pullback_pct"]
+
+    ref = state.get("preco_referencia")
+    active_cfg = get_active_config()
+
+    if ref is None:
+        return False, "sem referencia"
+
+    ref = float(ref)
+    queda_cfg = float(active_cfg["queda"])
+    preco_disparo = ref * (1 - queda_cfg / 100)
+
+    # 1) Entrada clássica por queda em qualquer regime
+    if preco <= preco_disparo and can_buy():
+        return True, f"queda clássica {queda_cfg}%"
+
+    # 2) Continuação de tendência em ALTA:
+    # compra em pequeno pullback + rsi saudável
+    if regime == "ALTA":
+        if pullback >= 0.35 and pullback <= 1.20 and 48 <= rsi <= 68 and can_buy():
+            return True, "continuação em tendência de alta"
+
+    # 3) Reversão em QUEDA:
+    # entra só quando está muito esticado pra baixo
+    if regime == "QUEDA":
+        if rsi <= 28 and pullback >= 1.0 and can_buy():
+            return True, "reversão em sobrevenda"
+
+    # 4) Lateral:
+    # scalp curto em sobrevenda moderada
+    if regime == "LATERAL":
+        if rsi <= 38 and pullback >= 0.45 and can_buy():
+            return True, "scalp em lateral"
+
+    return False, "sem gatilho"
 
 
 # =========================================================
@@ -244,6 +443,12 @@ def main_menu() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⚙️ Config", callback_data="config"),
             InlineKeyboardButton("🧾 Logs", callback_data="logs"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🤖 Estratégia: {'AUTO' if state.get('auto_estrategia', True) else 'MANUAL'}",
+                callback_data="toggle_auto_estrategia",
+            ),
         ],
         [
             InlineKeyboardButton(f"🧠 Modo: {state['modo']}", callback_data="modo"),
@@ -357,14 +562,26 @@ def cooldown_menu() -> InlineKeyboardMarkup:
 
 def status_text() -> str:
     preco = state.get("ultimo_preco")
+    active_cfg = get_active_config()
+
     txt = [
         "📊 STATUS DO BOT",
         "",
         f"Modo: {state['modo']}",
         f"Rodando: {'✅ SIM' if state['rodando'] else '⛔ NÃO'}",
+        f"Estratégia: {'AUTO' if state.get('auto_estrategia', True) else 'MANUAL'}",
+        f"Regime mercado: {state.get('regime_mercado', '---')}",
         f"Preço atual: {format_brl(float(preco)) if preco else '---'}",
         f"Referência: {format_brl(float(state['preco_referencia'])) if state.get('preco_referencia') else '---'}",
-        f"Posições abertas: {len(open_positions())} / {int(state['config']['max_dca'])}",
+        "",
+        "⚙️ CONFIG ATIVA",
+        f"Queda: {active_cfg['queda']}%",
+        f"Lucro: {active_cfg['lucro']}%",
+        f"Valor: {format_brl(float(active_cfg['valor']))}",
+        f"Max DCA: {active_cfg['max_dca']}",
+        f"Cooldown: {active_cfg['cooldown']}s",
+        "",
+        f"Posições abertas: {len(open_positions())} / {int(active_cfg['max_dca'])}",
         f"Total investido aberto: {format_brl(total_investido_aberto())}",
         f"P/L aberto: {format_brl(total_pnl_aberto(preco))}",
         f"Lucro total realizado: {format_brl(float(state['lucro_total']))}",
@@ -386,6 +603,7 @@ def positions_text() -> str:
             f"   Qtd BTC: {float(p['q']):.8f}",
             f"   TP: {format_brl(float(p['tp']))}",
             f"   Modo da compra: {p.get('modo', '---')}",
+            f"   Motivo: {p.get('motivo', '---')}",
             "",
         ])
     return "\n".join(lines).strip()
@@ -404,7 +622,6 @@ def logs_text() -> str:
 
 def generate_btc_chart() -> str:
     klines = get_public_klines(limit=100, interval="5m")
-
     closes = [float(k[4]) for k in klines]
 
     plt.figure(figsize=(10, 5))
@@ -441,8 +658,9 @@ def generate_lucro_chart() -> Optional[str]:
 # =========================================================
 
 def buy_position(preco: float, motivo: str) -> None:
-    valor = float(state["config"]["valor"])
-    lucro_pct = float(state["config"]["lucro"])
+    active_cfg = get_active_config()
+    valor = float(active_cfg["valor"])
+    lucro_pct = float(active_cfg["lucro"])
 
     qty = valor / preco
     executed_price = preco
@@ -473,6 +691,7 @@ def buy_position(preco: float, motivo: str) -> None:
         "opened_at": datetime.now().isoformat(timespec="seconds"),
         "motivo": motivo,
         "modo": state["modo"],
+        "regime_na_entrada": state.get("regime_mercado", "INDEFINIDO"),
     })
     state["ultima_compra_ts"] = now_ts()
     save_state(state)
@@ -521,7 +740,7 @@ def close_position(p: Dict[str, Any], preco_saida: float, motivo: str) -> float:
 
 
 # =========================================================
-# BOT LOOP
+# LOOP PRINCIPAL
 # =========================================================
 
 async def bot_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -530,31 +749,55 @@ async def bot_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
         state["ultimo_preco"] = preco
         state["ultimo_check"] = datetime.now().strftime("%d/%m %H:%M:%S")
 
+        analysis = analyze_market()
+        state["regime_mercado"] = analysis["regime"]
+
+        if state.get("auto_estrategia", True):
+            active_cfg = strategy_for_regime(analysis["regime"])
+            state["config_ativa"] = active_cfg
+        else:
+            active_cfg = dict(state["config"])
+            state["config_ativa"] = active_cfg
+
+        snapshot = snapshot_strategy_text(analysis, active_cfg)
+        if snapshot != state.get("ultimo_snapshot_estrategia", ""):
+            state["ultimo_snapshot_estrategia"] = snapshot
+            state["historico_regime"].append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "regime": analysis["regime"],
+                "rsi": round(analysis["rsi"], 2),
+                "slope_pct": round(analysis["slope_pct"], 2),
+            })
+            state["historico_regime"] = state["historico_regime"][-100:]
+            add_log(f"Estratégia ativa: {snapshot}")
+
         if state["preco_referencia"] is None:
             state["preco_referencia"] = preco
 
         if state["rodando"]:
+            # Atualiza referência quando não há posição aberta e o preço sobe
             if len(open_positions()) == 0 and preco > float(state["preco_referencia"]):
                 state["preco_referencia"] = preco
 
-            ref = float(state["preco_referencia"])
-            queda_pct = float(state["config"]["queda"])
-            preco_disparo = ref * (1 - queda_pct / 100)
+            should_buy, reason = should_buy_professional(analysis, preco)
 
-            if preco <= preco_disparo and can_buy():
+            if should_buy:
                 try:
-                    buy_position(preco, "queda automática")
+                    buy_position(preco, reason)
                     state["preco_referencia"] = preco
 
                     if CHAT_ID:
+                        last = state["posicoes"][-1]
                         await context.bot.send_message(
                             chat_id=CHAT_ID,
                             text=(
                                 "🟢 COMPRA AUTOMÁTICA\n"
                                 f"Modo: {state['modo']}\n"
-                                f"Preço: {format_brl(state['posicoes'][-1]['preco'])}\n"
-                                f"Valor: {format_brl(float(state['posicoes'][-1]['valor']))}\n"
-                                f"Qtd BTC: {float(state['posicoes'][-1]['q']):.8f}"
+                                f"Regime: {state.get('regime_mercado', '---')}\n"
+                                f"Motivo: {reason}\n"
+                                f"Preço: {format_brl(float(last['preco']))}\n"
+                                f"Valor: {format_brl(float(last['valor']))}\n"
+                                f"Qtd BTC: {float(last['q']):.8f}"
                             ),
                         )
                 except Exception as e:
@@ -571,6 +814,7 @@ async def bot_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 text=(
                                     "🔴 VENDA AUTOMÁTICA\n"
                                     f"Modo: {p.get('modo', 'SIMULADO')}\n"
+                                    f"Regime na entrada: {p.get('regime_na_entrada', '---')}\n"
                                     f"Entrada: {format_brl(float(p['preco']))}\n"
                                     f"Saída: {format_brl(float(p['preco_saida']))}\n"
                                     f"Lucro: {format_brl(lucro)}"
@@ -589,7 +833,7 @@ async def bot_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================================================
-# COMMANDS
+# COMMAND
 # =========================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -641,14 +885,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if data == "config":
             await query.edit_message_text(
-                "⚙️ CONFIGURAÇÃO",
+                "⚙️ CONFIGURAÇÃO MANUAL\n\nQuando a estratégia AUTO estiver ligada, o bot usa a config automática do regime.\nA config abaixo continua salva como base manual.",
                 reply_markup=config_menu(),
             )
             return
 
         if data == "grafico_btc":
             path = generate_btc_chart()
-            await context.bot.send_photo(chat_id=query.message.chat_id, photo=open(path, "rb"))
+            with open(path, "rb") as f:
+                await context.bot.send_photo(chat_id=query.message.chat_id, photo=f)
             return
 
         if data == "grafico_lucro":
@@ -659,7 +904,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     text="Ainda não há histórico de lucro para gerar gráfico."
                 )
             else:
-                await context.bot.send_photo(chat_id=query.message.chat_id, photo=open(path, "rb"))
+                with open(path, "rb") as f:
+                    await context.bot.send_photo(chat_id=query.message.chat_id, photo=f)
+            return
+
+        if data == "toggle_auto_estrategia":
+            state["auto_estrategia"] = not state.get("auto_estrategia", True)
+            save_state(state)
+            add_log(
+                f"Estratégia alterada para {'AUTO' if state['auto_estrategia'] else 'MANUAL'}"
+            )
+            await query.edit_message_text(
+                f"🤖 Estratégia agora está em: {'AUTO' if state['auto_estrategia'] else 'MANUAL'}",
+                reply_markup=main_menu(),
+            )
             return
 
         if data == "modo":
@@ -793,25 +1051,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             valor = float(data.replace("set_queda_", ""))
             state["config"]["queda"] = valor
             save_state(state)
-            add_log(f"Queda alterada para {valor}%")
+            add_log(f"Queda manual alterada para {valor}%")
             await query.edit_message_text(
-                f"✅ Queda alterada para {valor}%",
+                f"✅ Queda manual alterada para {valor}%",
                 reply_markup=config_menu(),
             )
             return
 
         if data.startswith("set_lucro_"):
             valor = float(data.replace("set_lucro_", ""))
+
             state["config"]["lucro"] = valor
 
-            for p in open_positions():
-                entrada = float(p["preco"])
-                p["tp"] = entrada * (1 + valor / 100)
+            if not state.get("auto_estrategia", True):
+                for p in open_positions():
+                    entrada = float(p["preco"])
+                    p["tp"] = entrada * (1 + valor / 100)
 
             save_state(state)
-            add_log(f"Lucro alterado para {valor}%")
+            add_log(f"Lucro manual alterado para {valor}%")
             await query.edit_message_text(
-                f"✅ Lucro alterado para {valor}%",
+                f"✅ Lucro manual alterado para {valor}%",
                 reply_markup=config_menu(),
             )
             return
@@ -820,9 +1080,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             valor = float(data.replace("set_valor_", ""))
             state["config"]["valor"] = valor
             save_state(state)
-            add_log(f"Valor alterado para {valor}")
+            add_log(f"Valor manual alterado para {valor}")
             await query.edit_message_text(
-                f"✅ Valor alterado para {format_brl(valor)}",
+                f"✅ Valor manual alterado para {format_brl(valor)}",
                 reply_markup=config_menu(),
             )
             return
@@ -831,9 +1091,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             valor = int(data.replace("set_dca_", ""))
             state["config"]["max_dca"] = valor
             save_state(state)
-            add_log(f"Max DCA alterado para {valor}")
+            add_log(f"Max DCA manual alterado para {valor}")
             await query.edit_message_text(
-                f"✅ Max DCA alterado para {valor}",
+                f"✅ Max DCA manual alterado para {valor}",
                 reply_markup=config_menu(),
             )
             return
@@ -842,9 +1102,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             valor = int(data.replace("set_cooldown_", ""))
             state["config"]["cooldown"] = valor
             save_state(state)
-            add_log(f"Cooldown alterado para {valor}s")
+            add_log(f"Cooldown manual alterado para {valor}s")
             await query.edit_message_text(
-                f"✅ Cooldown alterado para {valor}s",
+                f"✅ Cooldown manual alterado para {valor}s",
                 reply_markup=config_menu(),
             )
             return
