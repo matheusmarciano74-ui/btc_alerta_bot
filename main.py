@@ -521,6 +521,10 @@ def valor_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("20", callback_data="set_valor_20"),
+            InlineKeyboardButton("30", callback_data="set_valor_30"),
+            InlineKeyboardButton("40", callback_data="set_valor_40"),
+        ],
+        [
             InlineKeyboardButton("50", callback_data="set_valor_50"),
             InlineKeyboardButton("100", callback_data="set_valor_100"),
         ],
@@ -782,9 +786,33 @@ def close_all_real_positions(preco_ref: float, motivo: str) -> float:
     if free_btc <= 0:
         raise RuntimeError("Saldo BTC livre zerado na Binance.")
 
-    sell_qty = adjust_quantity_to_step(free_btc)
+    try:
+        sell_qty = adjust_quantity_to_step(free_btc)
+    except Exception:
+        sell_qty = round(free_btc * 0.999, 6)
 
-    order = client.order_market_sell(symbol=SYMBOL, quantity=sell_qty)
+    if sell_qty <= 0:
+        raise RuntimeError("Quantidade inválida após ajuste.")
+
+    order = None
+    last_error = None
+    for _ in range(3):
+        try:
+            order = client.order_market_sell(symbol=SYMBOL, quantity=sell_qty)
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            try:
+                sell_qty = adjust_quantity_to_step(sell_qty * 0.999)
+            except Exception:
+                sell_qty = round(sell_qty * 0.999, 6)
+
+            if sell_qty <= 0:
+                break
+
+    if order is None:
+        raise RuntimeError(f"Falha ao vender tudo no modo REAL: {last_error}")
 
     executed_qty = float(order.get("executedQty", 0) or 0)
     cummulative_quote_qty = float(order.get("cummulativeQuoteQty", 0) or 0)
