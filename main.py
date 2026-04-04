@@ -228,6 +228,17 @@ def get_free_asset_balance(asset: str) -> float:
     return float(balance.get("free", 0) or 0)
 
 
+def get_real_balances() -> Tuple[float, float]:
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        return 0.0, 0.0
+    try:
+        brl = get_free_asset_balance(QUOTE_ASSET)
+        btc = get_free_asset_balance(BASE_ASSET)
+        return brl, btc
+    except Exception:
+        return 0.0, 0.0
+
+
 def open_positions() -> List[Dict[str, Any]]:
     return [p for p in state["posicoes"] if p.get("status") == "OPEN"]
 
@@ -576,6 +587,7 @@ def cooldown_menu() -> InlineKeyboardMarkup:
 def status_text() -> str:
     preco = state.get("ultimo_preco")
     active_cfg = get_active_config()
+    brl_real, btc_real = get_real_balances()
 
     txt = [
         "📊 STATUS DO BOT",
@@ -586,6 +598,10 @@ def status_text() -> str:
         f"Regime mercado: {state.get('regime_mercado', '---')}",
         f"Preço atual: {format_brl(float(preco)) if preco else '---'}",
         f"Referência: {format_brl(float(state['preco_referencia'])) if state.get('preco_referencia') else '---'}",
+        "",
+        "💼 SALDO REAL BINANCE",
+        f"BRL livre: {format_brl(brl_real)}",
+        f"BTC livre: {btc_real:.8f}",
         "",
         "⚙️ CONFIG ATIVA",
         f"Queda: {active_cfg['queda']}%",
@@ -603,16 +619,22 @@ def status_text() -> str:
     return "\n".join(txt)
 
 
+
 def positions_text() -> str:
     pos = open_positions()
     if not pos:
         return "📦 Nenhuma posição aberta."
 
+    preco_atual = state.get("ultimo_preco") or get_public_price()
     lines = ["📦 POSIÇÕES ABERTAS", ""]
     for i, p in enumerate(pos, start=1):
+        valor_atual = float(p["q"]) * float(preco_atual)
+        lucro_atual = valor_atual - float(p["valor"])
         lines.extend([
             f"{i}) Entrada: {format_brl(float(p['preco']))}",
-            f"   Valor: {format_brl(float(p['valor']))}",
+            f"   Valor investido: {format_brl(float(p['valor']))}",
+            f"   Valor atual: {format_brl(valor_atual)}",
+            f"   Lucro atual: {format_brl(lucro_atual)}",
             f"   Qtd BTC: {float(p['q']):.8f}",
             f"   TP: {format_brl(float(p['tp']))}",
             f"   Modo da compra: {p.get('modo', '---')}",
@@ -622,11 +644,14 @@ def positions_text() -> str:
     return "\n".join(lines).strip()
 
 
-def logs_text() -> str:
-    logs = state.get("logs", [])
-    if not logs:
-        return "🧾 Sem logs ainda."
-    return "🧾 ÚLTIMOS LOGS\n\n" + "\n".join(logs[-12:])
+
+def positions_menu() -> InlineKeyboardMarkup:
+    pos = open_positions()
+    rows = []
+    for i, _p in enumerate(pos, start=1):
+        rows.append([InlineKeyboardButton(f"🔴 Vender posição #{i}", callback_data=f"sell_pos_{i-1}")])
+    rows.append([InlineKeyboardButton("⬅️ Voltar", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 # =========================================================
@@ -745,9 +770,29 @@ def close_position_real_single(p: Dict[str, Any], preco_ref: float, motivo: str)
 
     client = get_binance_client()
 
-    sell_qty = adjust_quantity_to_step(qty)
+    free_btc = get_free_asset_balance(BASE_ASSET)
+    qty_base = min(qty, free_btc)
+    if qty_base <= 0:
+        raise RuntimeError("Sem BTC suficiente na conta para vender esta posição.")
 
-    order = client.order_market_sell(symbol=SYMBOL, quantity=sell_qty)
+    try:
+        sell_qty = adjust_quantity_to_step(qty_base * 0.999)
+    except Exception:
+        sell_qty = round(qty_base * 0.999, 6)
+
+    if sell_qty <= 0:
+        raise RuntimeError("Quantidade inválida após ajuste para venda da posição.")
+
+    last_error = None
+    order = None
+    for _tentativa in range(3):
+        try:
+            order = client.order_market_sell(symbol=SYMBOL, quantity=sell_qty)
+            break
+        except Exception as e:
+            last_error = e
+    if order is None:
+        raise RuntimeError(f"Falha ao vender posição na Binance: {last_error}")
 
     executed_qty = float(order.get("executedQty", 0) or 0)
     cummulative_quote_qty = float(order.get("cummulativeQuoteQty", 0) or 0)
@@ -769,16 +814,21 @@ def close_position_real_single(p: Dict[str, Any], preco_ref: float, motivo: str)
 
     save_state(state)
     add_log(
-        f"Venda REAL em {format_brl(executed_exit_price)} | "
+        f"Venda REAL posição em {format_brl(executed_exit_price)} | "
         f"lucro {format_brl(lucro)} | motivo: {motivo}"
     )
     return lucro
 
 
-def close_all_real_positions(preco_ref: float, motivo: str) -> float:
+def close_all_real_positions(preco_ref: float, motivo: str) -> Dict[str, Any]:
     abertas = list(open_positions())
     if not abertas:
-        return 0.0
+        return {
+            "ok": False,
+            "message": "Não há posições abertas.",
+            "lucro_total": 0.0,
+            "remaining_btc": 0.0,
+        }
 
     client = get_binance_client()
 
@@ -787,32 +837,23 @@ def close_all_real_positions(preco_ref: float, motivo: str) -> float:
         raise RuntimeError("Saldo BTC livre zerado na Binance.")
 
     try:
-        sell_qty = adjust_quantity_to_step(free_btc)
+        sell_qty = adjust_quantity_to_step(free_btc * 0.999)
     except Exception:
         sell_qty = round(free_btc * 0.999, 6)
 
     if sell_qty <= 0:
-        raise RuntimeError("Quantidade inválida após ajuste.")
+        raise RuntimeError("Quantidade inválida após ajuste para venda total.")
 
-    order = None
     last_error = None
-    for _ in range(3):
+    order = None
+    for _tentativa in range(3):
         try:
             order = client.order_market_sell(symbol=SYMBOL, quantity=sell_qty)
-            last_error = None
             break
         except Exception as e:
             last_error = e
-            try:
-                sell_qty = adjust_quantity_to_step(sell_qty * 0.999)
-            except Exception:
-                sell_qty = round(sell_qty * 0.999, 6)
-
-            if sell_qty <= 0:
-                break
-
     if order is None:
-        raise RuntimeError(f"Falha ao vender tudo no modo REAL: {last_error}")
+        raise RuntimeError(f"Falha ao vender tudo na Binance: {last_error}")
 
     executed_qty = float(order.get("executedQty", 0) or 0)
     cummulative_quote_qty = float(order.get("cummulativeQuoteQty", 0) or 0)
@@ -847,11 +888,32 @@ def close_all_real_positions(preco_ref: float, motivo: str) -> float:
     state["historico_lucro"].append(float(state["lucro_total"]))
 
     save_state(state)
-    add_log(
-        f"Venda REAL geral em {format_brl(executed_exit_price)} | "
-        f"lucro total {format_brl(lucro_total)} | motivo: {motivo}"
-    )
-    return lucro_total
+
+    remaining_btc = get_free_asset_balance(BASE_ASSET)
+    ok = remaining_btc <= 0.000001
+    if ok:
+        add_log(
+            f"Venda REAL geral em {format_brl(executed_exit_price)} | "
+            f"lucro total {format_brl(lucro_total)} | motivo: {motivo}"
+        )
+        message = f"🔴 Todas as posições foram vendidas.\nLucro desta saída: {format_brl(lucro_total)}"
+
+    else:
+        add_log(
+            f"ALERTA: venda total executada, mas ainda sobrou BTC na conta: {remaining_btc:.8f}"
+        )
+        message = (
+            f"⚠️ A ordem de venda foi enviada, mas ainda sobrou BTC na conta: {remaining_btc:.8f}\n"
+
+            f"Lucro desta saída: {format_brl(lucro_total)}"
+        )
+
+    return {
+        "ok": ok,
+        "message": message,
+        "lucro_total": lucro_total,
+        "remaining_btc": remaining_btc,
+    }
 
 
 # =========================================================
@@ -989,8 +1051,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if data == "positions":
             await query.edit_message_text(
                 positions_text(),
-                reply_markup=main_menu(),
+                reply_markup=positions_menu(),
             )
+            return
+
+        if data.startswith("sell_pos_"):
+            idx = int(data.split("_")[-1])
+            abertas = open_positions()
+            if idx < 0 or idx >= len(abertas):
+                await query.edit_message_text(
+                    "❌ Posição inválida.",
+                    reply_markup=positions_menu(),
+                )
+                return
+
+            pos = abertas[idx]
+            preco_ref = get_public_price()
+            try:
+                if pos.get("modo") == "REAL":
+                    lucro = close_position_real_single(pos, preco_ref, "venda manual individual")
+                else:
+                    lucro = close_position_simulada(pos, preco_ref, "venda manual individual")
+
+                remaining_btc = get_free_asset_balance(BASE_ASSET) if BINANCE_API_KEY and BINANCE_API_SECRET else 0.0
+                msg = (
+                    f"🔴 Posição #{idx + 1} vendida.\n"
+                    f"Lucro realizado: {format_brl(lucro)}"
+                )
+                if pos.get("modo") == "REAL" and remaining_btc > 0.000001:
+                    msg += f"\nBTC livre restante na conta: {remaining_btc:.8f}"
+
+                await query.edit_message_text(
+                    msg,
+                    reply_markup=main_menu(),
+                )
+            except Exception as e:
+                add_log(f"Erro em vender posição individual: {e}")
+                await query.edit_message_text(
+                    f"❌ Erro ao vender posição individual:\n{e}",
+
+                    reply_markup=positions_menu(),
+                )
             return
 
         if data == "logs":
